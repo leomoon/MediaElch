@@ -1,0 +1,127 @@
+name: Build AppImage
+
+on:
+  push:
+    tags:
+      - "v*.*.*"
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "AppImage version in vX.Y.Z format"
+        required: true
+        default: "v0.0.0"
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  build-appimage:
+    name: Build AppImage
+    runs-on: ubuntu-24.04
+
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v6
+        with:
+          submodules: recursive
+          fetch-depth: 0
+
+      - name: Prepare build version
+        env:
+          BUILD_TAG: ${{ inputs.version || github.ref_name }}
+        run: |
+          if ! [[ "$BUILD_TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "Version must use the vX.Y.Z format."
+            exit 1
+          fi
+
+          release_version="${BUILD_TAG#v}"
+          project_version="$(sed -nE 's/.*AppVersionStr\[\] = "([^"]+)";.*/\1/p' Version.h)"
+          if [[ "$GITHUB_EVENT_NAME" == push && "$project_version" != "$release_version" ]]; then
+            echo "Tag $BUILD_TAG does not match Version.h version $project_version." >&2
+            exit 1
+          fi
+
+          sed -i -E 's/(AppVersionFullStr\[\] = ")[^"]+(";)/\1'"$release_version"'\2/' Version.h
+
+          git \
+            -c user.name="github-actions[bot]" \
+            -c user.email="41898282+github-actions[bot]@users.noreply.github.com" \
+            tag --annotate --force "$BUILD_TAG" --message "Build $BUILD_TAG" HEAD
+
+      - name: Download verified FFmpeg archive
+        shell: bash
+        run: |
+          set -euo pipefail
+          source .ci/third_party_versions.sh
+          archive_dir=third_party/packaging_linux
+          archive_path="$archive_dir/$LINUX_FFMPEG_ARCHIVE_NAME"
+          archive_url="https://johnvansickle.com/ffmpeg/releases/ffmpeg-release-amd64-static.tar.xz"
+          mkdir --parents "$archive_dir"
+          curl --fail --location --retry 3 --output "$archive_path" "$archive_url"
+          printf '%s  %s\n' "$LINUX_FFMPEG_SHA512" "$archive_path" | sha512sum --check
+
+      - name: Build AppImage
+        run: |
+          ./.ci/linux/build_linux_release_in_docker.sh
+          ./.ci/linux/package_linux_appimage_in_docker.sh
+
+      - name: Name release AppImage
+        env:
+          RELEASE_VERSION: ${{ inputs.version || github.ref_name }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          assets=(MediaElch_linux_*.AppImage)
+          if (( ${#assets[@]} != 1 )); then
+            echo "Expected exactly one AppImage asset, found ${#assets[@]}." >&2
+            exit 1
+          fi
+          mv "${assets[0]}" "MediaElch_linux_${RELEASE_VERSION#v}.AppImage"
+
+      - name: Upload AppImage
+        uses: actions/upload-artifact@v7
+        with:
+          name: MediaElch-AppImage-${{ inputs.version || github.ref_name }}
+          path: MediaElch_linux_*.AppImage
+          if-no-files-found: error
+
+  release:
+    name: Publish GitHub Release
+    if: github.event_name == 'push'
+    needs: build-appimage
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+
+    steps:
+      - name: Download AppImage
+        uses: actions/download-artifact@v7
+        with:
+          name: MediaElch-AppImage-${{ github.ref_name }}
+          path: dist
+
+      - name: Create or update release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          assets=(dist/*.AppImage)
+          if (( ${#assets[@]} != 1 )); then
+            echo "Expected exactly one AppImage asset, found ${#assets[@]}." >&2
+            exit 1
+          fi
+
+          if gh release view "$GITHUB_REF_NAME" --json isDraft --jq '.isDraft' > is-draft.txt 2>/dev/null; then
+            gh release upload "$GITHUB_REF_NAME" "${assets[@]}" --clobber
+            if [[ "$(<is-draft.txt)" == true ]]; then
+              gh release edit "$GITHUB_REF_NAME" --draft=false
+            fi
+          else
+            gh release create "$GITHUB_REF_NAME" "${assets[@]}" --verify-tag --generate-notes
+          fi
